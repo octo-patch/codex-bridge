@@ -1,7 +1,7 @@
 {
   "name": "codex-bridge",
   "version": "1.0.0",
-  "description": "Zero-dependency local proxy: translates OpenAI Responses API to Chat Completions for DeepSeek, Xiaomi MiMo, and OpenAI behind a single base_url",
+  "description": "Zero-dependency local proxy: translates OpenAI Responses API to Chat Completions for DeepSeek, Xiaomi MiMo, MiniMax, and OpenAI behind a single base_url",
   "main": "proxy.mjs",
   "type": "module",
   "scripts": {
@@ -14,6 +14,7 @@
     "deepseek",
     "deepseek-v4",
     "mimo",
+    "minimax",
     "openai",
     "proxy",
     "responses-api",

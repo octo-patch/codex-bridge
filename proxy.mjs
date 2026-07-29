@@ -56,7 +56,7 @@ const PROXY_KEYS_RAW = (process.env.PROXY_KEYS || "").trim();
 
 // Map<key, provider | "*">
 const PROXY_KEY_TABLE = new Map();
-const VALID_LOCK_PROVIDERS = new Set(["deepseek", "mimo", "openai", "*"]);
+const VALID_LOCK_PROVIDERS = new Set(["deepseek", "mimo", "minimax", "openai", "*"]);
 
 function loadProxyKeyTable() {
   for (const entry of parseCsv(PROXY_KEYS_RAW)) {
@@ -96,6 +96,10 @@ const MIMO_BASE = process.env.MIMO_BASE_URL || "https://token-plan-cn.xiaomimimo
 const MIMO_KEY = process.env.MIMO_API_KEY || "";
 const MIMO_MODELS = parseCsv(process.env.MIMO_MODELS || "mimo-v2.5-pro");
 
+const MINIMAX_BASE = process.env.MINIMAX_BASE_URL || "https://api.minimax.io/v1";
+const MINIMAX_KEY = process.env.MINIMAX_API_KEY || "";
+const MINIMAX_MODELS = parseCsv(process.env.MINIMAX_MODELS || "MiniMax-M3,MiniMax-M2.7");
+
 const OPENAI_BASE = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 // Default empty — OpenAI is opt-in, set OPENAI_MODELS or OPENAI_API_KEY explicitly to enable.
@@ -115,8 +119,8 @@ function getGithubToken() {
   return _githubToken;
 }
 
-if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY) {
-  console.error("At least one upstream provider key is required: set DEEPSEEK_API_KEY, MIMO_API_KEY, and/or OPENAI_API_KEY");
+if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY && !MINIMAX_KEY) {
+  console.error("At least one upstream provider key is required: set DEEPSEEK_API_KEY, MIMO_API_KEY, MINIMAX_API_KEY, and/or OPENAI_API_KEY");
   process.exit(1);
 }
 
@@ -130,7 +134,7 @@ const MODEL_CATALOG_PATH = (process.env.MODEL_CATALOG_PATH || "").trim();
 function loadCatalogModels(path) {
   try {
     const raw = JSON.parse(fs.readFileSync(path, "utf-8"));
-    const out = { deepseek: [], mimo: [], openai: [] };
+    const out = { deepseek: [], mimo: [], minimax: [], openai: [] };
     for (const m of raw.models || []) {
       if (!m?.slug) continue;
       let p = (m.provider || "").toLowerCase();
@@ -138,11 +142,12 @@ function loadCatalogModels(path) {
         const s = m.slug.toLowerCase();
         if (s.startsWith("deepseek")) p = "deepseek";
         else if (s.startsWith("mimo") || s.startsWith("xiaomi")) p = "mimo";
+        else if (s.startsWith("minimax")) p = "minimax";
         else if (s.startsWith("gpt-") || s.startsWith("o1") || s.startsWith("o3") || s.startsWith("o4") || s.startsWith("codex-") || s.startsWith("chatgpt-")) p = "openai";
       }
       if (out[p]) out[p].push(m.slug);
     }
-    console.log(`[codex-bridge] model_catalog: loaded ${path} (deepseek=${out.deepseek.length}, mimo=${out.mimo.length}, openai=${out.openai.length})`);
+    console.log(`[codex-bridge] model_catalog: loaded ${path} (deepseek=${out.deepseek.length}, mimo=${out.mimo.length}, minimax=${out.minimax.length}, openai=${out.openai.length})`);
     return out;
   } catch (err) {
     console.warn(`[codex-bridge] model_catalog: ${path} unreadable (${err.message}), falling back to env lists`);
@@ -153,6 +158,7 @@ const CATALOG = MODEL_CATALOG_PATH ? loadCatalogModels(MODEL_CATALOG_PATH) : nul
 if (CATALOG) {
   if (CATALOG.deepseek.length) DEEPSEEK_MODELS.splice(0, DEEPSEEK_MODELS.length, ...CATALOG.deepseek);
   if (CATALOG.mimo.length) MIMO_MODELS.splice(0, MIMO_MODELS.length, ...CATALOG.mimo);
+  if (CATALOG.minimax.length) MINIMAX_MODELS.splice(0, MINIMAX_MODELS.length, ...CATALOG.minimax);
   if (CATALOG.openai.length) OPENAI_MODELS.splice(0, OPENAI_MODELS.length, ...CATALOG.openai);
 }
 
@@ -162,6 +168,7 @@ if (CATALOG) {
 const OAI_COMPAT_PROVIDERS = {
   deepseek: { base: DEEPSEEK_BASE, key: DEEPSEEK_KEY, models: DEEPSEEK_MODELS, defaultModel: DEEPSEEK_MODELS[0] || "deepseek-v4-pro", envKey: "DEEPSEEK_API_KEY" },
   mimo:     { base: MIMO_BASE,     key: MIMO_KEY,     models: MIMO_MODELS,     defaultModel: MIMO_MODELS[0]     || "mimo-v2.5-pro",   envKey: "MIMO_API_KEY"     },
+  minimax:  { base: MINIMAX_BASE,  key: MINIMAX_KEY,  models: MINIMAX_MODELS,  defaultModel: MINIMAX_MODELS[0]  || "MiniMax-M3",      envKey: "MINIMAX_API_KEY"  },
 };
 
 const enabledProviders = new Set();
@@ -376,6 +383,7 @@ function getFallbackProvider() {
 const OAI_COMPAT_NAME_HINTS = [
   { provider: "deepseek", tokens: ["deepseek"] },
   { provider: "mimo",     tokens: ["mimo", "xiaomi"] },
+  { provider: "minimax",  tokens: ["minimax"] },
 ];
 
 function resolveProviderForModel(model) {
@@ -619,15 +627,18 @@ function normalizeMessages(messages, { coerceStrings = false } = {}) {
 //       (NB: `enable_thinking: false` is silently ignored by DeepSeek)
 //   MiMo (mimo-v2.5-*):       low | medium | high
 //     - same `thinking: { type: "disabled" }` to disable
+//   MiniMax (MiniMax-M3):     adaptive | disabled
+//     - `thinking: { type: "disabled" }` to disable; otherwise reasoning_effort
+//       is passed through so the model adapts its thinking to the requested level
 //
 // Translation rules (per provider):
 //
-//   Codex effort       DeepSeek                          MiMo
-//   ----------------   --------------------------------  --------------------------------
-//   none               thinking:{type:"disabled"}        thinking:{type:"disabled"}
-//   minimal            reasoning_effort:"low"            reasoning_effort:"low"
-//   low / medium / high reasoning_effort:<same>          reasoning_effort:<same>
-//   xhigh              reasoning_effort:"xhigh"          reasoning_effort:"high" (clamped)
+//   Codex effort       DeepSeek                          MiMo                             MiniMax
+//   ----------------   --------------------------------  -------------------------------  --------------------------------
+//   none               thinking:{type:"disabled"}        thinking:{type:"disabled"}        thinking:{type:"disabled"}
+//   minimal            reasoning_effort:"low"            reasoning_effort:"low"            reasoning_effort:"low"
+//   low / medium / high reasoning_effort:<same>          reasoning_effort:<same>           reasoning_effort:<same>
+//   xhigh              reasoning_effort:"xhigh"          reasoning_effort:"high" (clamped) reasoning_effort:"high" (clamped)
 //
 // `max` is NOT in Codex's enum (Codex would refuse it during config parse), so it
 // can't reach the proxy from a Codex client. We still accept it here for direct
@@ -645,6 +656,10 @@ function applyEffortTranslation(req, effort, provider) {
     return;
   }
   if (provider === "mimo" && (e === "max" || e === "xhigh")) {
+    req.reasoning_effort = "high";
+    return;
+  }
+  if (provider === "minimax" && (e === "max" || e === "xhigh")) {
     req.reasoning_effort = "high";
     return;
   }
