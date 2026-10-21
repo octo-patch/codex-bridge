@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file=.env proxy.mjs",
-    "smoke": "./scripts/smoke.sh"
+    "smoke": "./scripts/smoke.sh",
+    "test": "node --test --test-concurrency=1 scripts/*.test.mjs"
   },
   "keywords": [
     "codex",

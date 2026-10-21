@@ -98,7 +98,7 @@ const MIMO_MODELS = parseCsv(process.env.MIMO_MODELS || "mimo-v2.5-pro");
 
 const MINIMAX_BASE = process.env.MINIMAX_BASE_URL || "https://api.minimax.io/v1";
 const MINIMAX_KEY = process.env.MINIMAX_API_KEY || "";
-const MINIMAX_MODELS = parseCsv(process.env.MINIMAX_MODELS || "MiniMax-M3,MiniMax-M2.7");
+const MINIMAX_MODELS = parseCsv(process.env.MINIMAX_MODELS || "MiniMax-M3.1-Flash,MiniMax-M3");
 
 const OPENAI_BASE = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
@@ -168,7 +168,7 @@ if (CATALOG) {
 const OAI_COMPAT_PROVIDERS = {
   deepseek: { base: DEEPSEEK_BASE, key: DEEPSEEK_KEY, models: DEEPSEEK_MODELS, defaultModel: DEEPSEEK_MODELS[0] || "deepseek-v4-pro", envKey: "DEEPSEEK_API_KEY" },
   mimo:     { base: MIMO_BASE,     key: MIMO_KEY,     models: MIMO_MODELS,     defaultModel: MIMO_MODELS[0]     || "mimo-v2.5-pro",   envKey: "MIMO_API_KEY"     },
-  minimax:  { base: MINIMAX_BASE,  key: MINIMAX_KEY,  models: MINIMAX_MODELS,  defaultModel: MINIMAX_MODELS[0]  || "MiniMax-M3",      envKey: "MINIMAX_API_KEY"  },
+  minimax:  { base: MINIMAX_BASE,  key: MINIMAX_KEY,  models: MINIMAX_MODELS,  defaultModel: MINIMAX_MODELS[0]  || "MiniMax-M3.1-Flash",      envKey: "MINIMAX_API_KEY"  },
 };
 
 const enabledProviders = new Set();
@@ -493,7 +493,7 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
     return;
   }
 
-  const needsLocalResolution = targetProvider === "deepseek" || previous.provider !== targetProvider;
+  const needsLocalResolution = targetProvider === "deepseek" || targetProvider === "minimax" || previous.provider !== targetProvider;
   if (!needsLocalResolution) return;
 
   const chainItems = resolveResponseChain(body.previous_response_id);
@@ -627,26 +627,49 @@ function normalizeMessages(messages, { coerceStrings = false } = {}) {
 //       (NB: `enable_thinking: false` is silently ignored by DeepSeek)
 //   MiMo (mimo-v2.5-*):       low | medium | high
 //     - same `thinking: { type: "disabled" }` to disable
-//   MiniMax (MiniMax-M3):     adaptive | disabled
-//     - `thinking: { type: "disabled" }` to disable; otherwise reasoning_effort
-//       is passed through so the model adapts its thinking to the requested level
+//   MiniMax-M3.1-Flash: adaptive only; low | medium | high | xhigh | max
+//     - omitted effort defaults to max; none / disabled are rejected
+//   MiniMax-M3: adaptive | disabled; effort does not tune thinking depth
 //
 // Translation rules (per provider):
 //
-//   Codex effort       DeepSeek                          MiMo                             MiniMax
-//   ----------------   --------------------------------  -------------------------------  --------------------------------
-//   none               thinking:{type:"disabled"}        thinking:{type:"disabled"}        thinking:{type:"disabled"}
-//   minimal            reasoning_effort:"low"            reasoning_effort:"low"            reasoning_effort:"low"
-//   low / medium / high reasoning_effort:<same>          reasoning_effort:<same>           reasoning_effort:<same>
-//   xhigh              reasoning_effort:"xhigh"          reasoning_effort:"high" (clamped) reasoning_effort:"high" (clamped)
+//   Codex effort       DeepSeek                          MiMo
+//   ----------------   --------------------------------  --------------------------------
+//   none               thinking:{type:"disabled"}        thinking:{type:"disabled"}
+//   minimal            reasoning_effort:"low"            reasoning_effort:"low"
+//   low / medium / high reasoning_effort:<same>          reasoning_effort:<same>
+//   xhigh              reasoning_effort:"xhigh"          reasoning_effort:"high" (clamped)
 //
 // `max` is NOT in Codex's enum (Codex would refuse it during config parse), so it
 // can't reach the proxy from a Codex client. We still accept it here for direct
 // callers that want DeepSeek's extended max tier; MiMo clamps it like xhigh.
 // Anything else is passed through as-is and the upstream gets to 400 it.
 function applyEffortTranslation(req, effort, provider) {
+  const e = String(effort || "").toLowerCase().trim();
+  if (provider === "minimax") {
+    const model = normalizeModelId(req.model);
+    if (model === "minimax-m3.1-flash") {
+      const reject = (message) => { throw Object.assign(new Error(message), { statusCode: 400 }); };
+      if (e === "none" || (req.thinking && req.thinking.type !== "adaptive")) {
+        reject("MiniMax-M3.1-Flash requires adaptive thinking; none/disabled is not supported");
+      }
+      if (req.service_tier != null || req.reasoning_split === false) {
+        reject("MiniMax-M3.1-Flash does not support service_tier or reasoning_split=false");
+      }
+      const mapped = e === "minimal" ? "low" : e;
+      if (mapped && !["low", "medium", "high", "xhigh", "max"].includes(mapped)) {
+        reject("Unsupported MiniMax-M3.1-Flash reasoning effort");
+      }
+      if (mapped) req.reasoning_effort = mapped;
+      return;
+    }
+    if (model === "minimax-m3") {
+      if (e === "none") req.thinking = { type: "disabled" };
+      else if (e && !req.thinking) req.thinking = { type: "adaptive" };
+      return;
+    }
+  }
   if (!effort) return;
-  const e = String(effort).toLowerCase().trim();
   if (e === "none") {
     req.thinking = { type: "disabled" };
     return;
@@ -680,15 +703,19 @@ function responsesRequestToChatCompletions(body, provider) {
   // upstream `delta.reasoning_content` on each turn and stash it on the stored
   // entry; here we replay it so DeepSeek's thinking-mode tool-call round-trip
   // doesn't 400 on a missing `reasoning_content`. Scanning all entries is fine
-  // because the store is hard-capped (STORE_MAX, default 500). Only build the
-  // index for DeepSeek — MiMo / OpenAI don't accept reasoning_content fields.
+  // because the store is hard-capped (STORE_MAX, default 500). MiniMax also
+  // needs the original assistant content, including any inline thinking tags.
   const reasoningByCallId = new Map();
-  if (provider === "deepseek") {
+  const contentByCallId = new Map();
+  if (provider === "deepseek" || provider === "minimax") {
     for (const entry of responseStore.values()) {
-      if (!entry.reasoningContent) continue;
+      if (provider === "minimax" && entry.provider !== provider) continue;
       for (const out of entry.output || []) {
         if (out.type === "function_call" && out.call_id) {
-          reasoningByCallId.set(out.call_id, entry.reasoningContent);
+          if (entry.reasoningContent) reasoningByCallId.set(out.call_id, entry.reasoningContent);
+          if (provider === "minimax" && entry.assistantContent != null) {
+            contentByCallId.set(out.call_id, entry.assistantContent);
+          }
         }
       }
     }
@@ -705,7 +732,9 @@ function responsesRequestToChatCompletions(body, provider) {
       // (DeepSeek emits one reasoning per response, shared by all tool_calls.)
       for (const tc of pendingToolCalls) {
         const r = reasoningByCallId.get(tc.id);
-        if (r) { msg.reasoning_content = r; break; }
+        if (r) msg.reasoning_content = r;
+        if (contentByCallId.has(tc.id)) msg.content = contentByCallId.get(tc.id);
+        if (r && provider !== "minimax") break;
       }
       messages.push(msg);
       pendingToolCalls = [];
@@ -824,6 +853,12 @@ function responsesRequestToChatCompletions(body, provider) {
     }
   }
 
+  if (provider === "minimax") {
+    req.model = body.model || OAI_COMPAT_PROVIDERS.minimax.defaultModel;
+    for (const field of ["thinking", "service_tier", "reasoning_split"]) {
+      if (body[field] != null) req[field] = body[field];
+    }
+  }
   applyEffortTranslation(req, body.reasoning?.effort, provider);
   if (body.parallel_tool_calls != null) req.parallel_tool_calls = body.parallel_tool_calls;
 
@@ -984,7 +1019,7 @@ function buildStreamingResponseEvents(responseId, model, previousResponseId, met
   };
 }
 
-async function handleStreamingResponse(req, upstreamRes, res, model, previousResponseId, metadata) {
+async function handleStreamingResponse(req, upstreamRes, res, model, previousResponseId, metadata, provider) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -998,6 +1033,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
   await writeWithBackpressure(res, events.inProgress());
 
   let fullText = "";
+  let assistantContent = "";
   let reasoningContent = "";
   let inThink = false;
   let messageStarted = false;
@@ -1038,6 +1074,11 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
         const finishReason = parsed.choices?.[0]?.finish_reason;
         if (!delta && !finishReason) continue;
 
+        if (provider === "minimax") {
+          if (typeof delta?.content === "string") assistantContent += delta.content;
+          if (typeof delta?.reasoning_content === "string") reasoningContent += delta.reasoning_content;
+        }
+
         if (delta?.tool_calls) {
           for (const tc of delta.tool_calls) {
             const idx = tc.index ?? 0;
@@ -1074,8 +1115,8 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
           // stored response and replay it on the next turn (see
           // `responsesRequestToChatCompletions`) so DeepSeek's thinking-mode
           // tool-call round-trip doesn't 400 on a missing `reasoning_content`.
-          reasoningContent += delta.reasoning_content;
-          continue;
+          if (provider !== "minimax") reasoningContent += delta.reasoning_content;
+          if (provider !== "minimax" || !delta.content) continue;
         }
 
         if (delta?.content) {
@@ -1114,7 +1155,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
   if (clientGone(res)) {
     log.warn(`[proxy] client disconnected mid-stream (${responseId})`);
     try { res.end(); } catch { /* ignore */ }
-    return { responseId, output: streamOutput || [], reasoningContent };
+    return { responseId, output: streamOutput || [], reasoningContent, assistantContent };
   }
 
   if (!completionSent) {
@@ -1126,7 +1167,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
   }
 
   res.end();
-  return { responseId, output: streamOutput || [], reasoningContent };
+  return { responseId, output: streamOutput || [], reasoningContent, assistantContent };
 }
 
 async function sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, finishReason, usage, previousResponseId, metadata) {
@@ -1628,12 +1669,13 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     }
   }
 
+  if (provider === "minimax" && !body.model) body.model = cfg.defaultModel;
   const chatReq = responsesRequestToChatCompletions(body, provider);
   // Honour the model the client asked for if it belongs to this provider; otherwise fall back to the
   // provider's first configured model. (Codex usually sends the configured `model` field already.)
   const requested = normalizeModelId(chatReq.model);
   const isProviderModel = cfg.models.some((m) => normalizeModelId(m) === requested);
-  chatReq.model = isProviderModel ? chatReq.model : cfg.defaultModel;
+  chatReq.model = isProviderModel || (provider === "minimax" && requested) ? chatReq.model : cfg.defaultModel;
   const isStream = chatReq.stream;
 
   const upstreamUrl = `${cfg.base}/chat/completions`;
@@ -1682,6 +1724,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
       previousResponseId: originalPreviousResponseId,
       breakerFired: hardBreakerFired,
       reasoningContent: result.response?.choices?.[0]?.message?.reasoning_content || "",
+      ...(provider === "minimax" ? { assistantContent: result.response?.choices?.[0]?.message?.content } : {}),
     });
 
     if (isStream) await sendResponseAsStream(res, responsesResponse, req);
@@ -1704,13 +1747,14 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   }
 
   if (isStream) {
-    const { responseId: streamRespId, output: streamOutput, reasoningContent: streamReasoning } = await handleStreamingResponse(
+    const { responseId: streamRespId, output: streamOutput, reasoningContent: streamReasoning, assistantContent } = await handleStreamingResponse(
       req,
       upstreamRes,
       res,
       body.model,
       originalPreviousResponseId,
-      body.metadata
+      body.metadata,
+      provider
     );
     storeResponse(streamRespId, {
       provider,
@@ -1719,6 +1763,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
       previousResponseId: originalPreviousResponseId,
       breakerFired: hardBreakerFired,
       reasoningContent: streamReasoning || "",
+      ...(provider === "minimax" ? { assistantContent } : {}),
     });
     return;
   }
@@ -1731,6 +1776,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     input: originalInput,
     output: responsesResponse.output,
     reasoningContent: nonStreamReasoning,
+    ...(provider === "minimax" ? { assistantContent: ccResponse.choices?.[0]?.message?.content } : {}),
     previousResponseId: originalPreviousResponseId,
     breakerFired: hardBreakerFired,
   });
@@ -1746,7 +1792,7 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
 
   const requested = normalizeModelId(body.model);
   const isProviderModel = body.model && cfg.models.some((m) => normalizeModelId(m) === requested);
-  body.model = isProviderModel ? body.model : cfg.defaultModel;
+  body.model = isProviderModel || (provider === "minimax" && requested) ? body.model : cfg.defaultModel;
   const isStream = body.stream || false;
 
   const validated = normalizeMessages(body.messages || [], { coerceStrings: true });
@@ -1758,7 +1804,7 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
   //   - body.reasoning?.effort (Responses-style field, in case caller mixes them)
   // are normalised through the same per-provider translator that the responses path uses.
   const ccEffort = body.reasoning_effort || body.reasoning?.effort;
-  if (ccEffort) {
+  if (ccEffort || provider === "minimax") {
     delete body.reasoning_effort;
     delete body.reasoning;
     applyEffortTranslation(body, ccEffort, provider);
@@ -2039,7 +2085,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 400, { error: { message: `Unknown provider resolved: ${provider}` } });
     } catch (err) {
       log.error("[proxy] responses route error:", err.message);
-      if (!res.headersSent) sendJson(res, 500, { error: { message: err.message } });
+      if (!res.headersSent) sendJson(res, err.statusCode || 500, { error: { message: err.message } });
     }
     return;
   }
@@ -2087,7 +2133,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 400, { error: { message: `Unknown provider resolved: ${provider}` } });
     } catch (err) {
       log.error("[proxy] chat/completions route error:", err.message);
-      if (!res.headersSent) sendJson(res, 500, { error: { message: err.message } });
+      if (!res.headersSent) sendJson(res, err.statusCode || 500, { error: { message: err.message } });
     }
     return;
   }

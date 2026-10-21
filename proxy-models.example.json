@@ -105,15 +105,13 @@
       "experimental_supported_tools": []
     },
     {
-      "slug": "MiniMax-M3",
-      "display_name": "MiniMax M3",
+      "slug": "MiniMax-M3.1-Flash",
+      "display_name": "MiniMax M3.1 Flash",
       "supported_reasoning_levels": [
-        { "effort": "none",    "description": "Thinking disabled" },
-        { "effort": "minimal", "description": "Minimal reasoning (mapped to low)" },
-        { "effort": "low",     "description": "Low reasoning effort" },
-        { "effort": "medium",  "description": "Medium reasoning effort" },
-        { "effort": "high",    "description": "High reasoning effort" },
-        { "effort": "xhigh",   "description": "Extra-high reasoning effort (clamped to high)" }
+        { "effort": "low",    "description": "Low reasoning effort" },
+        { "effort": "medium", "description": "Medium reasoning effort" },
+        { "effort": "high",   "description": "High reasoning effort" },
+        { "effort": "xhigh",  "description": "Extra-high reasoning effort" }
       ],
       "shell_type": "default",
       "visibility": "list",
@@ -127,15 +125,11 @@
       "experimental_supported_tools": []
     },
     {
-      "slug": "MiniMax-M2.7",
-      "display_name": "MiniMax M2.7",
+      "slug": "MiniMax-M3",
+      "display_name": "MiniMax M3",
       "supported_reasoning_levels": [
-        { "effort": "none",    "description": "Thinking always on (model does not support disabling)" },
-        { "effort": "minimal", "description": "Minimal reasoning (mapped to low)" },
-        { "effort": "low",     "description": "Low reasoning effort" },
-        { "effort": "medium",  "description": "Medium reasoning effort" },
-        { "effort": "high",    "description": "High reasoning effort" },
-        { "effort": "xhigh",   "description": "Extra-high reasoning effort (clamped to high)" }
+        { "effort": "none", "description": "Thinking disabled" },
+        { "effort": "high", "description": "Adaptive thinking (depth is not tunable)" }
       ],
       "shell_type": "default",
       "visibility": "list",

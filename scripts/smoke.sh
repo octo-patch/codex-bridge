@@ -57,7 +57,7 @@ elif [[ -n "${PROXY_KEYS:-}" ]]; then
     case "$MODEL" in
       deepseek*) want=deepseek ;;
       mimo*)     want=mimo ;;
-      minimax*) want=minimax ;;
+      MiniMax*|minimax*) want=minimax ;;
       *)         want="" ;;
     esac
     if [[ -n "$want" ]]; then
